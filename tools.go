@@ -1,0 +1,145 @@
+//go:build tools
+
+package main
+
+import (
+	"compress/gzip"
+	"context"
+	"encoding/json"
+	"os"
+
+	"github.com/Vilsol/go-pob-data/loader"
+
+	"github.com/Vilsol/timeless-jewels/calculator"
+	"github.com/Vilsol/timeless-jewels/data"
+
+	// findAll sweeps the shipped tables, so this tool needs them installed.
+	_ "github.com/Vilsol/timeless-jewels/data/embedded"
+)
+
+// Uses separate steps so finder step has the new data loaded by data package
+
+//go:generate go run tools.go find
+//go:generate go tool crystalline -app timeless-jewels -js-out ./frontend/src/lib/types/index.js -ts-out ./frontend/src/lib/types/index.d.ts -banner "/* eslint-disable */" ./...
+
+func main() {
+	if len(os.Args) < 2 {
+		return
+	}
+
+	if os.Args[1] == "find" {
+		findAll()
+	}
+
+	if os.Args[1] == "translations" {
+		downloadTranslations(os.Args[2])
+	}
+}
+
+type noCache struct{}
+
+// DSH: 词条语言。可选 en / cn / tw 等（go-pob-data 提供的客户端语言）。
+var translationLanguage = "cn"
+
+func (noCache) Get(string) ([]byte, error) { return nil, nil }
+func (noCache) Set(string, []byte) error   { return nil }
+func (noCache) Exists(string) bool         { return false }
+
+// go-pob-data only publishes stat descriptions as msgpack bundles, re-encoded here to the JSON the frontend reads.
+func downloadTranslations(version string) {
+	files := map[string]string{
+		"stat_descriptions":                    "./data/embedded/stat_descriptions.json.gz",
+		"passive_skill_stat_descriptions":      "./data/embedded/passive_skill_stat_descriptions.json.gz",
+		"passive_skill_aura_stat_descriptions": "./data/embedded/passive_skill_aura_stat_descriptions.json.gz",
+	}
+
+	for name, path := range files {
+		// DSH: 中文数据。go-pob-data 的 CN 客户端词条，与编年史/PoB 汉化同源。
+		file, err := loader.LoadBundledTranslation(context.Background(), version, translationLanguage, name, noCache{})
+		if err != nil {
+			panic(err)
+		}
+
+		writeZipped(path, file)
+	}
+}
+
+func writeZipped(path string, data interface{}) {
+	b, err := json.Marshal(data)
+	if err != nil {
+		panic(err)
+	}
+
+	out, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0777)
+	if err != nil {
+		panic(err)
+	}
+
+	writer := gzip.NewWriter(out)
+	if _, err := writer.Write(b); err != nil {
+		panic(err)
+	}
+
+	if err := writer.Close(); err != nil {
+		panic(err)
+	}
+}
+
+func findAll() {
+	foundStats := make(map[data.JewelType]map[uint32]int)
+	applicable := data.GetApplicablePassives()
+
+	for jewelType := range data.TimelessJewelConquerors {
+		foundStats[jewelType] = make(map[uint32]int)
+
+		var firstConqueror data.Conqueror
+		for conqueror := range data.TimelessJewelConquerors[jewelType] {
+			firstConqueror = conqueror
+			break
+		}
+
+		println(jewelType.String())
+
+		min := data.TimelessJewelSeedRanges[jewelType].Min
+		max := data.TimelessJewelSeedRanges[jewelType].Max
+
+		if data.TimelessJewelSeedRanges[jewelType].Special {
+			min /= 20
+			max /= 20
+		}
+
+		for seed := min; seed <= max; seed++ {
+			realSeed := seed
+			if data.TimelessJewelSeedRanges[jewelType].Special {
+				realSeed *= 20
+			}
+
+			if realSeed%500 == 0 {
+				println(realSeed)
+			}
+
+			for _, skill := range applicable {
+				if skill.IsKeystone {
+					continue
+				}
+
+				results := calculator.Calculate(skill.Index, realSeed, jewelType, firstConqueror)
+				if results.AlternatePassiveSkill != nil {
+					for _, key := range results.AlternatePassiveSkill.StatsKeys {
+						foundStats[jewelType][key]++
+					}
+				}
+
+				for _, info := range results.AlternatePassiveAdditionInformations {
+					if info.AlternatePassiveAddition != nil {
+						for _, key := range info.AlternatePassiveAddition.StatsKeys {
+							foundStats[jewelType][key]++
+						}
+					}
+				}
+			}
+		}
+	}
+
+	writeZipped("./data/embedded/possible_stats.json.gz", foundStats)
+}
